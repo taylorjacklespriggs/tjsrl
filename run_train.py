@@ -4,10 +4,12 @@ from time import time
 from ll import LunarLander
 from qmodel import QModel
 from sample_store import SampleStore
+from keyboard_input import KeyboardInput
+from get_samples import get_samples
 
 BATCH_SIZE = 2**8
-EXTRA_STORE = 2**4
-TRAINING_ITERATIONS = 500
+EXTRA_STORE = 2**6
+TRAINING_ITERATIONS = 2**16
 
 def argmax(l):
     return max(enumerate(l), key=lambda v: v[1])[0]
@@ -20,12 +22,16 @@ class Trainer:
         self.last_state = None
         self.estimate_q = None
         self.max_cumulative = None
-        self.prob_scale = np.exp(-parameters['log_prob_scale'])
+        self.prob_scale = 1 #np.exp(-parameters['log_prob_scale'])
         self.discount = 1 - np.exp(-parameters['log_discount'])
 
     def reset(self):
         self.last_state = self.game.reset()
         self.estimate_q = self.qmodel.feed_one(self.last_state)
+
+    def update_with_sample(self, action, state, reward):
+        self.sample_store.add_sample(self.last_state, action, state, reward)
+        self.update(state)
 
     def update(self, state):
         self.last_state = state
@@ -37,13 +43,12 @@ class Trainer:
         )
         logits /= logits.sum()
         action = np.random.choice(np.arange(4, dtype=np.int8), p=logits)
-        return action, self.estimate_q[action]
+        return action
 
-    def sample(self):
-        action, action_q = self.get_action()
+
+    def sample(self, action):
         state, reward, done = self.game.do_action(action)
-        self.sample_store.add_sample(self.last_state, action, state, reward)
-        self.update(state)
+        self.update_with_sample(action, state, reward)
         return reward, done
 
     def compute_update(self):
@@ -67,7 +72,7 @@ class Trainer:
         self.game.render()
         done = False
         while not done:
-            action, _ = self.get_action()
+            action = self.get_action()
             state, _, done = self.game.do_action(action)
             self.update(state)
             game.render()
@@ -80,31 +85,49 @@ class Trainer:
         q[:, action] += self.qmodel.feed(new_state).max(axis=1)
         return np.log(self.qmodel.loss((state, q)))
 
+    def _run_one(self, get_action):
+        self.reset()
+        done = False
+        cumulative = 0
+        while not done:
+            reward, done = self.sample(get_action())
+            self.train()
+            cumulative += reward
+        if self.max_cumulative is None:
+            self.max_cumulative = cumulative
+        else:
+            self.max_cumulative = max(self.max_cumulative, cumulative)
+        return self.evaluate(), cumulative
+
+    def _run(self, get_action):
+        return iter(lambda: self._run_one(get_action), None)
+
+    def run_one_with_input(self):
+        ki = KeyboardInput()
+        ki.add_to_window(game.env.unwrapped.viewer.window)
+        def get_action():
+            self.game.render()
+            return ki.get_action()
+        return self._run_one(get_action)
+
+    def run_with_input(self):
+        ki = KeyboardInput()
+        ki.add_to_window(game.env.unwrapped.viewer.window)
+        def get_action():
+            self.game.render()
+            return ki.get_action()
+        for loss, cumulative in self._run(get_action):
+            yield loss, cumulative
+
     def run(self):
-        i = 0
-        r = 10
-        render = 10
-        for _ in range(TRAINING_ITERATIONS):
-            self.reset()
-            print("Game {:5d}".format(i), end='\r')
-            i += 1
-            done = False
-            cumulative = 0
-            while not done:
-                reward, done = self.sample()
-                self.train()
-                cumulative += reward
-                if r == render:
-                    self.game.render(0)
-            if self.max_cumulative is None:
-                self.max_cumulative = cumulative
-            else:
-                self.max_cumulative = max(self.max_cumulative, cumulative)
-            if r >= render:
-                r = 0
-            r += 1
-        print()
-        print("Finished training")
+        for _, (loss, cumulative) in zip(range(TRAINING_ITERATIONS), self._run(self.get_action)):
+            print(loss, cumulative)
+
+    def run_alternating(self):
+        for _ in self.run_with_input(): pass
+        self.show()
+        self.run()
+        self.show()
 
 if __name__ == '__main__':
     from sys import argv, exit
@@ -119,16 +142,6 @@ if __name__ == '__main__':
             name="RL LL {}".format(time()),
             parameters=[
                 dict(
-                    name='log_discount',
-                    bounds=dict(min=0, max=6),
-                    type='double',
-                ),
-                dict(
-                    name='log_learning_rate',
-                    bounds=dict(min=3, max=15),
-                    type='double',
-                ),
-                dict(
                     name='layer_1_size',
                     bounds=dict(min=1, max=200),
                     type='int',
@@ -139,31 +152,53 @@ if __name__ == '__main__':
                     type='int',
                 ),
                 dict(
-                    name='log_prob_scale',
-                    bounds=dict(min=0, max=10),
+                    name='log_discount',
+                    bounds=dict(min=0, max=6),
+                    type='double',
+                ),
+                dict(
+                    name='log_learning_rate',
+                    bounds=dict(min=3, max=15),
                     type='double',
                 ),
             ]
         )
         with tf.Session() as session:
+            import json
+            with open('assignments.json') as assignments_file:
+                assignments = json.load(assignments_file)
+            trainer = Trainer(game, session, assignments)
+            for loss, cumulative in trainer.run_with_input():
+                print(cumulative)
+            sample_store = trainer.sample_store
             while True:
                 suggestion = connection.experiments(e.id).suggestions().create()
                 assignments = suggestion.assignments
                 trainer = Trainer(game, session, assignments)
-                trainer.run()
-                evaluation = trainer.evaluate()
+                trainer.sample_store = sample_store
+                for i in range(TRAINING_ITERATIONS // 100):
+                    print(i * 100, end='\r')
+                    for _ in range(100):
+                        trainer.train()
+                loss = trainer.evaluate()
+                print(loss)
                 connection.experiments(e.id).observations().create(
                     suggestion=suggestion.id,
-                    values=[dict(value=-float(evaluation))]
+                    values=[dict(value=-float(loss))]
                 )
+            #     suggestion = connection.experiments(e.id).suggestions().create()
+            #     assignments = suggestion.assignments
+            #     trainer = Trainer(game, session, assignments)
+            #     trainer.run()
+            #     evaluation = trainer.evaluate()
+            #     connection.experiments(e.id).observations().create(
+            #         suggestion=suggestion.id,
+            #         values=[dict(value=-float(evaluation))]
+            #     )
     else:
+        import json
+        with open('assignments.json') as assignments_file:
+            assignments = json.load(assignments_file)
         with tf.Session() as session:
-            assignments = {
-                'layer_1_size': 166,
-                'layer_2_size': 75,
-                'log_discount': 1.0665122459164607,
-                'log_learning_rate': 13.334311180363606,
-                'log_prob_scale': 10.0,
-            }
             trainer = Trainer(game, session, assignments)
-            trainer.run()
+            trainer.run_alternating()

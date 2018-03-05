@@ -1,0 +1,7 @@
+{
+    "layer_1_size": 166,
+    "layer_2_size": 75,
+    "log_discount": 1.0665122459164607,
+    "log_learning_rate": 5,
+    "log_prob_scale": 10.0
+}
