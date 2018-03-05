@@ -83,7 +83,7 @@ class Trainer:
         q = self.qmodel.feed(state)
         q[:, action] = reward
         q[:, action] += self.qmodel.feed(new_state).max(axis=1)
-        return np.log(self.qmodel.loss((state, q)))
+        return np.log(self.qmodel.loss((state, q)) / state.shape[0])
 
     def _run_one(self, get_action):
         self.reset()
@@ -119,9 +119,9 @@ class Trainer:
         for loss, cumulative in self._run(get_action):
             yield loss, cumulative
 
-    def run(self):
-        for _, (loss, cumulative) in zip(range(TRAINING_ITERATIONS), self._run(self.get_action)):
-            print(loss, cumulative)
+    def run(self, training_iterations=TRAINING_ITERATIONS):
+        for _, (loss, cumulative) in zip(range(training_iterations), self._run(self.get_action)):
+            yield loss, cumulative
 
     def run_alternating(self):
         for _ in self.run_with_input(): pass
@@ -168,7 +168,7 @@ if __name__ == '__main__':
             with open('assignments.json') as assignments_file:
                 assignments = json.load(assignments_file)
             trainer = Trainer(game, session, assignments)
-            for loss, cumulative in trainer.run_with_input():
+            for loss, cumulative in trainer.run(10**6):
                 print(cumulative)
             sample_store = trainer.sample_store
             while True:
